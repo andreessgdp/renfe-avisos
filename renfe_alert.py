@@ -192,6 +192,10 @@ ICONO = {"libre": "🟢", "lleno": "🔴", "no_encontrado": "⚪", None: "⏳"}
 COMPRADO = "🎫"
 
 
+def admin_id():
+    return str(os.environ.get("TELEGRAM_CHAT_ID", ""))
+
+
 def fecha_larga(f):
     return f"{DIAS_ES[f.weekday()].capitalize()} {f.day} {MESES[f.month - 1]}"
 
@@ -204,11 +208,20 @@ def sentido(o):
     return "ida" if o == TRENES[0][1] else "vuelta"
 
 
-def texto_panel(estado, momento):
+def nombre_de(u):
+    n = (u.get("first_name") or "") + (" " + u["last_name"] if u.get("last_name") else "")
+    return (n.strip() or "Sin nombre") + (f" (@{u['username']})" if u.get("username") else "")
+
+
+def html(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def texto_panel(estado, usuario, momento):
     fechas = fechas_objetivo()
     if not fechas:
         return None
-    comprados = set(estado.get("comprados", []))
+    comprados = set(usuario.get("comprados", []))
     rango = f"{fechas[0].day}–{fechas[-1].day} {MESES[fechas[-1].month - 1]}"
     lineas = [f"🚆 <b>TUS TRENES</b>  ·  <i>{rango}</i>", ""]
     for f in fechas:
@@ -230,8 +243,8 @@ def texto_panel(estado, momento):
     return "\n".join(lineas)
 
 
-def botones_panel(estado, momento):
-    comprados = set(estado.get("comprados", []))
+def botones_panel(usuario, momento):
+    comprados = set(usuario.get("comprados", []))
     filas = []
     for f in fechas_objetivo():
         fila = []
@@ -254,35 +267,38 @@ def texto_aviso(fecha, hora, nombre):
             "<i>Corre, que estas plazas vuelan</i> ⚡")
 
 
-def actualizar_panel(estado, momento=None):
-    """Mantiene un único mensaje fijado con el estado de la semana y lo va editando."""
+def actualizar_panel(estado, chat_id, momento=None, nuevo=False):
+    """Mantiene un único mensaje fijado por persona con el estado de la semana y lo va editando."""
+    usuario = estado["usuarios"].get(chat_id)
+    if usuario is None:
+        return
     momento = momento or dt.datetime.fromisoformat(estado.get("ultima", ahora().isoformat()))
-    texto = texto_panel(estado, momento)
+    texto = texto_panel(estado, usuario, momento)
     if not texto:
         return
-    teclado = botones_panel(estado, momento)
+    teclado = botones_panel(usuario, momento)
     semana = fechas_objetivo()[0].isoformat()
-    panel = estado.get("panel") or {}
-    if panel.get("id") and panel.get("semana") == semana:
+    panel = usuario.get("panel") or {}
+    if not nuevo and panel.get("id") and panel.get("semana") == semana:
         try:
-            tg("editMessageText", message_id=panel["id"], text=texto, parse_mode="HTML",
-               reply_markup=teclado)
+            tg("editMessageText", chat_id=chat_id, message_id=panel["id"], text=texto,
+               parse_mode="HTML", reply_markup=teclado)
             return
         except Exception:  # noqa: BLE001  (mensaje borrado, etc.) -> se crea otro
             pass
-    msg = tg("sendMessage", text=texto, parse_mode="HTML", disable_notification="true",
-             reply_markup=teclado)
+    msg = tg("sendMessage", chat_id=chat_id, text=texto, parse_mode="HTML",
+             disable_notification="true", reply_markup=teclado)
     if msg:
         if panel.get("id"):
             try:
-                tg("unpinChatMessage", message_id=panel["id"])
+                tg("unpinChatMessage", chat_id=chat_id, message_id=panel["id"])
             except Exception:  # noqa: BLE001
                 pass
         try:
-            tg("pinChatMessage", message_id=msg["message_id"], disable_notification="true")
+            tg("pinChatMessage", chat_id=chat_id, message_id=msg["message_id"], disable_notification="true")
         except Exception:  # noqa: BLE001
             pass
-        estado["panel"] = {"id": msg["message_id"], "semana": semana}
+        usuario["panel"] = {"id": msg["message_id"], "semana": semana}
 
 
 def cargar_estado():
@@ -291,66 +307,159 @@ def cargar_estado():
             e = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         e = {}
-    if "trenes" not in e:  # formato antiguo: claves sueltas
+    if "trenes" not in e:  # formato muy antiguo: claves sueltas
         e = {"trenes": {k: v for k, v in e.items() if "|" in k}}
-    e.setdefault("comprados", [])
+    if "usuarios" not in e:  # formato de un solo usuario -> el admin
+        e["usuarios"] = {admin_id(): {"nombre": "Admin",
+                                      "comprados": e.pop("comprados", []),
+                                      "panel": e.pop("panel", None)}}
+    e["usuarios"].setdefault(admin_id(), {"nombre": "Admin", "comprados": []})
+    e.setdefault("pendientes", {})
+    e.setdefault("rechazados", [])
     return e
 
 
 def guardar_estado(estado):
     hoy = ahora().date().isoformat()
     estado["trenes"] = {k: v for k, v in estado["trenes"].items() if k.split("|")[0] >= hoy}
-    estado["comprados"] = sorted(k for k in set(estado.get("comprados", [])) if k.split("|")[0] >= hoy)
+    for u in estado["usuarios"].values():
+        u["comprados"] = sorted(k for k in set(u.get("comprados", [])) if k.split("|")[0] >= hoy)
     with open(ESTADO, "w", encoding="utf-8") as f:
         json.dump(estado, f, ensure_ascii=False, indent=1)
 
 
-# ------------------------------------------------------- botones del panel ---
+# ------------------------------------------------ mensajes y botones de Telegram ---
+def responder(cb, texto=None):
+    try:
+        if texto:
+            tg("answerCallbackQuery", callback_query_id=cb["id"], text=texto)
+        else:
+            tg("answerCallbackQuery", callback_query_id=cb["id"])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def lista_usuarios(estado):
+    filas = [[{"text": f"🗑️ Quitar a {u.get('nombre', cid)[:40]}", "callback_data": f"q|{cid}"}]
+             for cid, u in estado["usuarios"].items() if cid != admin_id()]
+    texto = "👥 <b>Personas con acceso</b>\n\n" + "\n".join(
+        f"• {html(u.get('nombre', cid))}" for cid, u in estado["usuarios"].items() if cid != admin_id()
+    ) if filas else "👥 De momento solo tienes acceso tú."
+    tg("sendMessage", text=texto, parse_mode="HTML", reply_markup={"inline_keyboard": filas})
+
+
+def procesar_mensaje(estado, m):
+    chat = str(m.get("chat", {}).get("id"))
+    if m.get("chat", {}).get("type") != "private":
+        return
+    texto = (m.get("text") or "").strip()
+    if chat in estado["usuarios"]:
+        if chat == admin_id() and texto.startswith("/usuarios"):
+            lista_usuarios(estado)
+        elif texto.startswith(("/start", "/panel")):
+            actualizar_panel(estado, chat, nuevo=True)
+        return
+    if chat in estado["rechazados"]:
+        return
+    if chat in estado["pendientes"]:
+        return  # ya pedido; no molestar otra vez
+    nombre = nombre_de(m.get("from", {}))
+    estado["pendientes"][chat] = {"nombre": nombre}
+    tg("sendMessage", chat_id=chat, parse_mode="HTML",
+       text="👋 ¡Hola! Este bot avisa cuando se liberan plazas en los Avant Segovia ⇄ Madrid.\n\n"
+            "⏳ He pedido permiso para darte acceso. Te escribo en cuanto te acepten.")
+    tg("sendMessage", parse_mode="HTML",
+       text=f"👤 <b>{html(nombre)}</b> quiere usar el bot de avisos.",
+       reply_markup={"inline_keyboard": [[{"text": "✅ Aceptar", "callback_data": f"a|{chat}"},
+                                          {"text": "❌ Rechazar", "callback_data": f"r|{chat}"}]]})
+
+
+def procesar_boton(estado, cb):
+    quien = str(cb.get("from", {}).get("id"))
+    datos = cb.get("data", "")
+    tipo, _, arg = datos.partition("|")
+    msg = cb.get("message") or {}
+
+    if tipo in ("a", "r", "q"):
+        if quien != admin_id():
+            return responder(cb)
+        persona = estado["pendientes"].pop(arg, None) or estado["usuarios"].get(arg) or {}
+        nombre = persona.get("nombre", arg)
+        if tipo == "a":
+            estado["usuarios"][arg] = {"nombre": nombre, "comprados": []}
+            if arg in estado["rechazados"]:
+                estado["rechazados"].remove(arg)
+            final = f"✅ <b>{html(nombre)}</b> ya tiene acceso."
+            tg("sendMessage", chat_id=arg, parse_mode="HTML",
+               text="✅ <b>¡Dentro!</b> Ya tienes acceso.\n\n"
+                    "Te he fijado arriba un panel con los trenes de la semana. Cuando un tren lleno "
+                    "tenga plazas te llegará un aviso 🟢, y puedes marcar con 🎫 los que ya tengas comprados.")
+            actualizar_panel(estado, arg, nuevo=True)
+            responder(cb, "Aceptado")
+        elif tipo == "r":
+            if arg not in estado["rechazados"]:
+                estado["rechazados"].append(arg)
+            final = f"❌ Has rechazado a <b>{html(nombre)}</b>."
+            responder(cb, "Rechazado")
+        else:  # quitar
+            estado["usuarios"].pop(arg, None)
+            if arg not in estado["rechazados"]:
+                estado["rechazados"].append(arg)
+            final = f"🗑️ <b>{html(nombre)}</b> ya no tiene acceso."
+            try:
+                tg("sendMessage", chat_id=arg, text="Tu acceso al bot de avisos de Renfe se ha retirado.")
+            except Exception:  # noqa: BLE001
+                pass
+            responder(cb, "Quitado")
+        if msg.get("message_id"):
+            try:
+                tg("editMessageText", message_id=msg["message_id"], text=final, parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
+    if tipo == "c" and quien in estado["usuarios"]:
+        usuario = estado["usuarios"][quien]
+        comprados = set(usuario.get("comprados", []))
+        fecha_s, hora, _ = arg.split("|")
+        f = dt.date.fromisoformat(fecha_s)
+        if arg in comprados:
+            comprados.discard(arg)
+            aviso = f"⬜ {DIAS_CORTOS[f.weekday()]} {f.day} {hora}: te vuelvo a avisar si se libera"
+        else:
+            comprados.add(arg)
+            aviso = f"🎫 {DIAS_CORTOS[f.weekday()]} {f.day} {hora}: marcado como comprado"
+        usuario["comprados"] = sorted(comprados)
+        responder(cb, aviso)
+        actualizar_panel(estado, quien)
+        return
+    responder(cb)
+
+
 def atender_telegram(espera=25):
-    """Espera hasta `espera` s a que pulses un botón del panel y lo procesa. Devuelve True si hubo cambios."""
+    """Espera hasta `espera` s a mensajes o pulsaciones de botones y los procesa."""
     if not os.environ.get("TELEGRAM_TOKEN"):
         time.sleep(espera)
-        return False
+        return
     estado = cargar_estado()
     try:
         updates = tg("getUpdates", offset=estado.get("offset", 0), timeout=espera,
-                     allowed_updates='["callback_query"]') or []
+                     allowed_updates='["message","callback_query"]') or []
     except Exception as e:  # noqa: BLE001
         print(f"getUpdates falló: {e}", file=sys.stderr)
         time.sleep(5)
-        return False
-    cambios = False
-    mi_chat = str(os.environ.get("TELEGRAM_CHAT_ID"))
+        return
     for u in updates:
         estado["offset"] = u["update_id"] + 1
-        cb = u.get("callback_query")
-        if not cb:
-            continue
-        datos = cb.get("data", "")
-        if str(cb.get("from", {}).get("id")) != mi_chat or not datos.startswith("c|"):
-            tg("answerCallbackQuery", callback_query_id=cb["id"])
-            continue
-        clave = datos[2:]
-        comprados = set(estado.get("comprados", []))
-        fecha_s, hora, _ = clave.split("|")
-        f = dt.date.fromisoformat(fecha_s)
-        if clave in comprados:
-            comprados.discard(clave)
-            aviso = f"⬜ {DIAS_CORTOS[f.weekday()]} {f.day} {hora}: te vuelvo a avisar si se libera"
-        else:
-            comprados.add(clave)
-            aviso = f"🎫 {DIAS_CORTOS[f.weekday()]} {f.day} {hora}: marcado como comprado"
-        estado["comprados"] = sorted(comprados)
         try:
-            tg("answerCallbackQuery", callback_query_id=cb["id"], text=aviso)
-        except Exception:  # noqa: BLE001
-            pass
-        cambios = True
+            if "callback_query" in u:
+                procesar_boton(estado, u["callback_query"])
+            elif "message" in u:
+                procesar_mensaje(estado, u["message"])
+        except Exception as e:  # noqa: BLE001
+            print(f"Error procesando update: {e}", file=sys.stderr)
     if updates:
-        if cambios:
-            actualizar_panel(estado)
         guardar_estado(estado)
-    return cambios
 
 
 async def comprobar():
@@ -359,16 +468,17 @@ async def comprobar():
     estado = cargar_estado()
     momento = ahora()
     avisos = []
+    # un trayecto solo se deja de mirar si TODOS lo tienen comprado
+    todos_comprado = set.intersection(*[set(u.get("comprados", [])) for u in estado["usuarios"].values()])
 
     async with async_playwright() as p:
         navegador = await p.chromium.launch(headless=True)
         try:
             for fecha in fechas_objetivo():
-                # agrupamos trenes por trayecto para hacer una sola búsqueda por día y sentido
                 trayectos = {}
                 for hora, o, d, nombre in TRENES:
                     salida = dt.datetime.combine(fecha, dt.time.fromisoformat(hora), TZ)
-                    if salida > momento and clave_tren(fecha, hora, o, d) not in estado["comprados"]:
+                    if salida > momento and clave_tren(fecha, hora, o, d) not in todos_comprado:
                         trayectos.setdefault((o, d), []).append((hora, nombre))
                 for (o, d), trenes in trayectos.items():
                     try:
@@ -384,27 +494,35 @@ async def comprobar():
                         print(f"{ICONO.get(nuevo)} {fecha} {hora} {nombre}: {nuevo} (antes: {viejo})")
                         if nuevo == "libre" and viejo in ("lleno", "no_encontrado"):
                             avisos.append((clave, fecha, hora, nombre, url_busqueda(o, d, fecha)))
-                        elif AVISAR_SI_SE_LLENA and nuevo == "lleno" and viejo == "libre":
-                            telegram(f"🔴 Se ha llenado el <code>{hora}</code> del {fecha_larga(fecha).lower()}",
-                                     silencioso=True)
                     await asyncio.sleep(2)  # sin prisas con la web de Renfe
         finally:
             await navegador.close()
 
-    # por si marcaste algo como comprado mientras se hacía la comprobación
-    estado["comprados"] = cargar_estado()["comprados"]
+    # recargamos usuarios/compras por si cambiaron mientras se hacía la comprobación
+    reciente = cargar_estado()
+    for k in ("usuarios", "pendientes", "rechazados", "offset"):
+        if k in reciente:
+            estado[k] = reciente[k]
     for clave, fecha, hora, nombre, enlace in avisos:
-        if clave in estado["comprados"]:
-            continue
-        telegram(texto_aviso(fecha, hora, nombre),
-                 botones=[[{"text": "🎟️ Reservar ahora", "url": enlace}]])
+        for chat_id, u in estado["usuarios"].items():
+            if clave in u.get("comprados", []):
+                continue
+            try:
+                tg("sendMessage", chat_id=chat_id, text=texto_aviso(fecha, hora, nombre), parse_mode="HTML",
+                   reply_markup={"inline_keyboard": [[{"text": "🎟️ Reservar ahora", "url": enlace}]]})
+            except Exception as e:  # noqa: BLE001
+                print(f"No pude avisar a {chat_id}: {e}", file=sys.stderr)
     estado["ultima"] = momento.isoformat()
-    actualizar_panel(estado, momento)
+    for chat_id in list(estado["usuarios"]):
+        try:
+            actualizar_panel(estado, chat_id, momento)
+        except Exception as e:  # noqa: BLE001
+            print(f"No pude actualizar el panel de {chat_id}: {e}", file=sys.stderr)
     guardar_estado(estado)
 
 
 def vigilar(minutos_total, cada=10):
-    """Comprueba Renfe cada `cada` min y, entre medias, atiende al momento los botones del panel."""
+    """Comprueba Renfe cada `cada` min y, entre medias, atiende al momento mensajes y botones."""
     fin = time.time() + minutos_total * 60
     proxima = 0.0
     while time.time() < fin:
