@@ -1,19 +1,24 @@
 name: Avisos Renfe
 
+# Cada ejecución se queda ~5 h comprobando cada 10 min y, al acabar,
+# lanza la siguiente ella sola. El cron es solo un respaldo por si la cadena se corta.
 on:
   schedule:
-    # Cada 10 min de 05:00 a 22:59 UTC (06:00-23:59 en Madrid en invierno)
-    - cron: "*/10 5-22 * * *"
+    - cron: "17 */4 * * *"
   workflow_dispatch:
 
 concurrency:
   group: avisos-renfe
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
-  comprobar:
+  vigilar:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
 
@@ -34,11 +39,19 @@ jobs:
           key: estado-${{ github.run_id }}
           restore-keys: estado-
 
-      - name: Comprobar plazas
+      - name: Comprobar cada 10 minutos (~5 h)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python renfe_alert.py
+        run: |
+          fin=$((SECONDS + 5*3600 - 600))
+          while [ $SECONDS -lt $fin ]; do
+            hora=$(TZ=Europe/Madrid date +%H)
+            if [ "$hora" -ge 6 ]; then   # de 0:00 a 6:00 no mira
+              python renfe_alert.py || echo "fallo en esta vuelta, sigo"
+            fi
+            sleep 600
+          done
 
       - name: Guardar estado
         if: always()
@@ -46,3 +59,9 @@ jobs:
         with:
           path: estado.json
           key: estado-${{ github.run_id }}
+
+      - name: Lanzar la siguiente ejecución
+        if: ${{ !cancelled() }}   # si la cancelas a mano, la cadena se para
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run avisos.yml --ref main --repo ${{ github.repository }}
