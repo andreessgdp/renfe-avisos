@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -153,30 +154,116 @@ async def buscar(navegador, origen, destino, fecha, intentos=2):
     raise RuntimeError(f"fallo buscando {origen}->{destino} {fecha}: {ultimo_error}")
 
 
-def telegram(texto):
+def tg(metodo, **params):
+    """Llama a la API de Telegram. Devuelve el 'result' o None si no hay Telegram configurado."""
     token = os.environ.get("TELEGRAM_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
-        print("[sin Telegram configurado] " + texto)
+        print(f"[sin Telegram] {metodo}: {params.get('text', '')}")
+        return None
+    params.setdefault("chat_id", chat)
+    if "reply_markup" in params:
+        params["reply_markup"] = json.dumps(params["reply_markup"])
+    datos = urllib.parse.urlencode(params).encode()
+    try:
+        r = json.load(urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{metodo}", datos, timeout=20))
+        return r.get("result")
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode(errors="ignore")
+        if "message is not modified" not in cuerpo:
+            print(f"Telegram {metodo} falló: {cuerpo}", file=sys.stderr)
+            raise
+        return None
+
+
+def telegram(texto, botones=None, silencioso=False):
+    params = {"text": texto, "parse_mode": "HTML", "disable_web_page_preview": "true",
+              "disable_notification": "true" if silencioso else "false"}
+    if botones:
+        params["reply_markup"] = {"inline_keyboard": botones}
+    return tg("sendMessage", **params)
+
+
+# ---------------------------------------------------------------- mensajes ---
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+DIAS_CORTOS = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
+ICONO = {"libre": "🟢", "lleno": "🔴", "no_encontrado": "⚪", None: "⏳"}
+
+
+def fecha_larga(f):
+    return f"{DIAS_ES[f.weekday()].capitalize()} {f.day} {MESES[f.month - 1]}"
+
+
+def texto_panel(trenes_estado, momento):
+    fechas = fechas_objetivo()
+    if not fechas:
+        return None
+    rango = f"{fechas[0].day}–{fechas[-1].day} {MESES[fechas[-1].month - 1]}"
+    lineas = [f"🚆 <b>TUS TRENES</b>  ·  <i>{rango}</i>", ""]
+    for f in fechas:
+        celdas = []
+        for hora, o, d, nombre in TRENES:
+            salida = dt.datetime.combine(f, dt.time.fromisoformat(hora), TZ)
+            if salida <= momento:
+                icono = "✔️"
+            else:
+                icono = ICONO.get(trenes_estado.get(f"{f.isoformat()}|{hora}|{o}-{d}"), "⏳")
+            sentido = "ida" if o == TRENES[0][1] else "vuelta"
+            celdas.append(f"{icono} <code>{hora}</code> {sentido}")
+        lineas.append(f"<b>{DIAS_CORTOS[f.weekday()]} {f.day:02d}</b>   " + "    ".join(celdas))
+    lineas += ["", "🟢 hay plazas   🔴 lleno   ✔️ ya salió",
+               f"<i>🔄 Actualizado a las {momento:%H:%M} · se refresca cada 10 min</i>"]
+    return "\n".join(lineas)
+
+
+def texto_aviso(fecha, hora, nombre):
+    return ("🟢 <b>¡PLAZA LIBRE!</b>\n\n"
+            f"<blockquote><b>{fecha_larga(fecha)}</b>\n"
+            f"🚄 <code>{hora}</code>  {nombre}</blockquote>\n"
+            "<i>Corre, que estas plazas vuelan</i> ⚡")
+
+
+def actualizar_panel(estado, momento):
+    """Mantiene un único mensaje fijado con el estado de la semana y lo va editando."""
+    texto = texto_panel(estado["trenes"], momento)
+    if not texto:
         return
-    datos = urllib.parse.urlencode({
-        "chat_id": chat, "text": texto, "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", datos, timeout=20).read()
+    semana = fechas_objetivo()[0].isoformat()
+    panel = estado.get("panel") or {}
+    if panel.get("id") and panel.get("semana") == semana:
+        try:
+            tg("editMessageText", message_id=panel["id"], text=texto, parse_mode="HTML")
+            return
+        except Exception:  # noqa: BLE001  (mensaje borrado, etc.) -> se crea otro
+            pass
+    msg = telegram(texto, silencioso=True)
+    if msg:
+        if panel.get("id"):
+            try:
+                tg("unpinChatMessage", message_id=panel["id"])
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            tg("pinChatMessage", message_id=msg["message_id"], disable_notification="true")
+        except Exception:  # noqa: BLE001
+            pass
+        estado["panel"] = {"id": msg["message_id"], "semana": semana}
 
 
 def cargar_estado():
     try:
         with open(ESTADO, encoding="utf-8") as f:
-            return json.load(f)
+            e = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        e = {}
+    if "trenes" not in e:  # formato antiguo: claves sueltas
+        e = {"trenes": {k: v for k, v in e.items() if "|" in k}}
+    return e
 
 
 def guardar_estado(estado):
     hoy = ahora().date().isoformat()
-    estado = {k: v for k, v in estado.items() if k.split("|")[0] >= hoy}  # limpia días pasados
+    estado["trenes"] = {k: v for k, v in estado["trenes"].items() if k.split("|")[0] >= hoy}
     with open(ESTADO, "w", encoding="utf-8") as f:
         json.dump(estado, f, ensure_ascii=False, indent=1)
 
@@ -185,9 +272,9 @@ async def comprobar():
     from playwright.async_api import async_playwright
 
     estado = cargar_estado()
-    primera_vez = not estado
-    resumen, avisos = [], []
+    trenes_estado = estado["trenes"]
     momento = ahora()
+    avisos = []
 
     async with async_playwright() as p:
         navegador = await p.chromium.launch(headless=True)
@@ -208,28 +295,24 @@ async def comprobar():
                     for hora, nombre in trenes:
                         clave = f"{fecha.isoformat()}|{hora}|{o}-{d}"
                         nuevo = estado_tren(viajes, hora)
-                        viejo = estado.get(clave)
-                        estado[clave] = nuevo
-                        etiqueta = f"{DIAS_ES[fecha.weekday()]} {fecha:%d/%m} · {hora} {nombre}"
-                        enlace = url_busqueda(o, d, fecha)
-                        icono = {"libre": "🟢", "lleno": "🔴"}.get(nuevo, "⚪")
-                        resumen.append(f"{icono} {etiqueta}")
-                        print(f"{icono} {etiqueta}: {nuevo} (antes: {viejo})")
-                        if not primera_vez:
-                            if nuevo == "libre" and viejo != "libre":
-                                avisos.append(f"🟢 <b>¡Plaza libre!</b> {etiqueta}\n<a href=\"{enlace}\">Reservar en Renfe</a>")
-                            elif AVISAR_SI_SE_LLENA and nuevo == "lleno" and viejo == "libre":
-                                avisos.append(f"🔴 Se ha llenado: {etiqueta}")
+                        viejo = trenes_estado.get(clave)
+                        trenes_estado[clave] = nuevo
+                        print(f"{ICONO.get(nuevo)} {fecha} {hora} {nombre}: {nuevo} (antes: {viejo})")
+                        # avisa si pasa de lleno a libre (no en la primera lectura de ese tren)
+                        if nuevo == "libre" and viejo in ("lleno", "no_encontrado"):
+                            avisos.append((fecha, hora, nombre, url_busqueda(o, d, fecha)))
+                        elif AVISAR_SI_SE_LLENA and nuevo == "lleno" and viejo == "libre":
+                            telegram(f"🔴 Se ha llenado el <code>{hora}</code> del {fecha_larga(fecha).lower()}",
+                                     silencioso=True)
                     await asyncio.sleep(2)  # sin prisas con la web de Renfe
         finally:
             await navegador.close()
 
+    for fecha, hora, nombre, enlace in avisos:
+        telegram(texto_aviso(fecha, hora, nombre),
+                 botones=[[{"text": "🎟️ Reservar ahora", "url": enlace}]])
+    actualizar_panel(estado, momento)
     guardar_estado(estado)
-    if primera_vez and resumen:
-        telegram("🚆 <b>Vigilando tus trenes</b>\n" + "\n".join(resumen)
-                 + "\n\nTe aviso cuando uno lleno pase a tener plazas.")
-    for a in avisos:
-        telegram(a)
 
 
 def mostrar_chat_id():
