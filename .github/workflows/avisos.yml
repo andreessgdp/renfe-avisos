@@ -39,19 +39,11 @@ jobs:
           key: estado-${{ github.run_id }}
           restore-keys: estado-
 
-      - name: Comprobar cada 10 minutos (~5 h)
+      - name: Vigilar ~5 h (Renfe cada 10 min, botones al instante)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          fin=$((SECONDS + 5*3600 - 600))
-          while [ $SECONDS -lt $fin ]; do
-            hora=$(TZ=Europe/Madrid date +%H)
-            if [ "$hora" -ge 6 ]; then   # de 0:00 a 6:00 no mira
-              python renfe_alert.py || echo "fallo en esta vuelta, sigo"
-            fi
-            sleep 600
-          done
+        run: python renfe_alert.py --vigilar 290
 
       - name: Guardar estado
         if: always()
